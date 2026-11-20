@@ -225,7 +225,7 @@ fn imm32(i: &Instruction) -> u32 {
     }
 }
 
-fn locate_header(pe: &Pe, data: &[u8], entry_off: usize) -> Option<(u32, u32, u32)> {
+fn locate_header_v21(pe: &Pe, data: &[u8], entry_off: usize) -> Option<(u32, u32, u32)> {
     let end = (entry_off + 4096).min(data.len());
     let mut decoder =
         Decoder::with_ip(32, &data[entry_off..end], entry_off as u64, DecoderOptions::NONE);
@@ -259,6 +259,38 @@ fn locate_header(pe: &Pe, data: &[u8], entry_off: usize) -> Option<(u32, u32, u3
     }
     if struct_offset > 0 && struct_size > 0 && struct_xor > 0 {
         Some((struct_offset, struct_size, struct_xor))
+    } else {
+        None
+    }
+}
+
+fn locate_header_v20(pe: &Pe, data: &[u8], entry_off: usize) -> Option<(u32, u32)> {
+    let end = (entry_off + 4096).min(data.len());
+    let mut decoder =
+        Decoder::with_ip(32, &data[entry_off..end], entry_off as u64, DecoderOptions::NONE);
+    let mut struct_offset = 0u32;
+    let mut struct_size = 0u32;
+    while decoder.can_decode() {
+        if struct_offset > 0 && struct_size > 0 {
+            return Some((struct_offset, struct_size));
+        }
+        let insn = decoder.decode();
+        if insn.is_invalid() {
+            continue;
+        }
+        if insn.mnemonic() == Mnemonic::Mov
+            && insn.op0_kind() == OpKind::Register
+            && is_imm(insn.op1_kind())
+        {
+            if struct_offset == 0 {
+                struct_offset = imm32(&insn).wrapping_sub(pe.image_base);
+                continue;
+            }
+            struct_size = imm32(&insn).wrapping_mul(4);
+        }
+    }
+    if struct_offset > 0 && struct_size > 0 {
+        Some((struct_offset, struct_size))
     } else {
         None
     }
@@ -302,6 +334,246 @@ fn align_up(v: u32, a: u32) -> u32 {
         return v;
     }
     v.div_ceil(a) * a
+}
+
+struct Unpacked {
+    section_index: usize,
+    new_section: Vec<u8>,
+    oep_va: u32,
+    variant: &'static str,
+}
+
+fn unpack_v21(pe: &Pe, data: &[u8], entry_off: usize) -> Option<Unpacked> {
+    let (struct_rva, struct_size, struct_xor) = locate_header_v21(pe, data, entry_off)?;
+    println!(
+        "[+] v2.1 stub header: rva=0x{:X} size={} xor=0x{:X}",
+        struct_rva, struct_size, struct_xor
+    );
+
+    let header_off = pe.rva_to_off(struct_rva)?;
+    if header_off + struct_size as usize > data.len() {
+        eprintln!("[!] stub header out of bounds");
+        return None;
+    }
+    let mut header = data[header_off..header_off + struct_size as usize].to_vec();
+    let mut xor_key = steam_xor(&mut header, struct_size as usize, 0);
+
+    let d0 = (struct_size / 4) == 0xD0;
+    let (pva_i, psz_i, dva_i, dsz_i, xt_i) = if d0 {
+        (8usize, 9usize, 14usize, 15usize, 16usize)
+    } else {
+        (9usize, 10usize, 15usize, 16usize, 17usize)
+    };
+    let payload_va = r32(&header, pva_i * 4);
+    let payload_size = r32(&header, psz_i * 4);
+    let drmp_va_off = r32(&header, dva_i * 4);
+    let drmp_size_off = r32(&header, dsz_i * 4);
+    let xtea_off = r32(&header, xt_i * 4);
+    println!(
+        "[+] header variant: {}  payloadVA=0x{:X} payloadSize={}",
+        if d0 { "0xD0" } else { "normal" },
+        payload_va,
+        payload_size
+    );
+
+    let payload_off = pe.rva_to_off(pe.va_to_rva(payload_va))?;
+    if payload_off + payload_size as usize > data.len() {
+        eprintln!("[!] payload out of bounds");
+        return None;
+    }
+    let mut payload = data[payload_off..payload_off + payload_size as usize].to_vec();
+    xor_key = steam_xor(&mut payload, payload_size as usize, xor_key);
+    println!(
+        "[+] payload decoded ({} bytes, key now 0x{:X})",
+        payload.len(),
+        xor_key
+    );
+
+    let drmp_va = r32(&payload, drmp_va_off as usize);
+    let drmp_size = r32(&payload, drmp_size_off as usize) as usize;
+    let drmp_off = pe.rva_to_off(pe.va_to_rva(drmp_va))?;
+    if drmp_off + drmp_size > data.len() {
+        eprintln!("[!] SteamDRMP out of bounds");
+        return None;
+    }
+    let mut drmp = data[drmp_off..drmp_off + drmp_size].to_vec();
+    println!("[+] SteamDRMP.dll: va=0x{:X} size={}", drmp_va, drmp_size);
+
+    let xtea_off = xtea_off as usize;
+    if xtea_off > payload.len() {
+        eprintln!("[!] xtea key offset out of range");
+        return None;
+    }
+    let key_count = (payload.len() - xtea_off) / 4;
+    let mut xtea_keys = Vec::with_capacity(key_count);
+    for i in 0..key_count {
+        xtea_keys.push(r32(&payload, xtea_off + i * 4));
+    }
+    drmp_decrypt_pass1(&mut drmp, drmp_size, &xtea_keys);
+    println!("[+] SteamDRMP decrypted ({} xtea keys)", xtea_keys.len());
+
+    let p1 = parse_pattern("8B ?? ?? ?? ?? ?? 89 ?? ?? ?? ?? ?? 8B ?? ?? ?? ?? ?? 89 ?? ?? ?? ?? ?? 8B ?? ?? ?? ?? ?? 89 ?? ?? ?? ?? ?? 8B ?? ?? ?? ?? ?? 89 ?? ?? ?? ?? ?? 8B ?? ?? ?? ?? ?? 89 ?? ?? ?? ?? ?? 8D ?? ?? ?? ?? ?? 05");
+    let p2 = parse_pattern("8B ?? ?? ?? ?? ?? 89 ?? ?? ?? ?? ?? 8B ?? ?? ?? ?? ?? 89 ?? ?? ?? ?? ?? 8B ?? ?? ?? ?? ?? 89 ?? ?? ?? ?? ?? 8B ?? ?? ?? ?? ?? 89 ?? ?? ?? ?? ?? 8B");
+    let p3 = parse_pattern("8B ?? ?? ?? ?? ?? 89 ?? ?? ?? ?? ?? 8B ?? ?? ?? ?? ?? A3 ?? ?? ?? ?? 8B ?? ?? ?? ?? ?? A3 ?? ?? ?? ?? 8B ?? ?? ?? ?? ?? A3 ?? ?? ?? ?? 8B ?? ?? ?? ?? ?? A3 ?? ?? ?? ?? 8B");
+
+    let (match_off, fallback) = if let Some(o) = find_pattern(&drmp, &p1) {
+        (o, false)
+    } else if let Some(o) = find_pattern(&drmp, &p2) {
+        (o, false)
+    } else if let Some(o) = find_pattern(&drmp, &p3) {
+        (o, true)
+    } else {
+        eprintln!("[!] failed to locate DRM offset table in SteamDRMP");
+        return None;
+    };
+    println!(
+        "[+] DRM offset table at SteamDRMP+0x{:X} (fallback={})",
+        match_off, fallback
+    );
+    if match_off + 1024 > drmp.len() {
+        eprintln!("[!] DRM offset table out of bounds");
+        return None;
+    }
+    let block = &drmp[match_off..match_off + 1024];
+    let (o0, o1, o2, o3, o4, o5, o6) = if fallback {
+        (2usize, 14usize, 25usize, 36usize, 47usize, 61usize, 72usize)
+    } else {
+        (2usize, 14usize, 26usize, 38usize, 50usize, 62usize, 67usize)
+    };
+    let mut offs = [0u32; 8];
+    for (i, o) in [o0, o1, o2, o3, o4, o5, o6].iter().enumerate() {
+        offs[i] = r32(block, *o);
+    }
+    offs[7] = offs[6].wrapping_add(16);
+    println!("[+] payload offsets: {:?}", offs);
+
+    let flags = r32(&payload, offs[0] as usize);
+    const NO_ENCRYPTION: u32 = 0x04;
+    let cs_va = r32(&payload, offs[3] as usize);
+    let cs_rva = if offs[3] != 0 {
+        pe.va_to_rva(cs_va)
+    } else {
+        pe.base_of_code
+    };
+    let cs_idx = pe
+        .section_for_rva(cs_rva)
+        .or_else(|| pe.section_for_rva(pe.base_of_code))?;
+    let sec = &pe.sections[cs_idx];
+    println!(
+        "[+] code section: {} va=0x{:X} raw=0x{:X}+0x{:X} flags=0x{:X}",
+        sec.name, sec.va, sec.raw_ptr, sec.raw_size, flags
+    );
+
+    let orig = data[sec.raw_ptr as usize..(sec.raw_ptr + sec.raw_size) as usize].to_vec();
+    let new_section = if flags & NO_ENCRYPTION == NO_ENCRYPTION {
+        println!("[+] code section is not encrypted");
+        orig.clone()
+    } else {
+        let aes_key = &payload[offs[5] as usize..offs[5] as usize + 32];
+        let aes_iv = &payload[offs[6] as usize..offs[6] as usize + 16];
+        let stolen = &payload[offs[7] as usize..offs[7] as usize + 16];
+        let enc_size = r32(&payload, offs[4] as usize) as usize;
+        println!(
+            "[+] decrypting: encSize={} sectionRawSize={} stolen={:02X?}",
+            enc_size, sec.raw_size, stolen
+        );
+        if enc_size + 16 > orig.len() {
+            eprintln!("[!] encrypted size exceeds section raw size");
+            return None;
+        }
+        let mut buf = vec![0u8; enc_size + 16];
+        buf[0..16].copy_from_slice(stolen);
+        buf[16..16 + enc_size]
+            .copy_from_slice(&data[sec.raw_ptr as usize..sec.raw_ptr as usize + enc_size]);
+        let mut iv = [0u8; 16];
+        iv.copy_from_slice(aes_iv);
+        let iv2 = aes256_ecb_decrypt_block(aes_key, &iv);
+        aes256_cbc_decrypt(aes_key, iv2, &mut buf);
+        let mut s = orig.clone();
+        s[0..enc_size].copy_from_slice(&buf[0..enc_size]);
+        s
+    };
+
+    let oep_va = r32(&payload, offs[2] as usize);
+    Some(Unpacked {
+        section_index: cs_idx,
+        new_section,
+        oep_va,
+        variant: "v2.1",
+    })
+}
+
+fn unpack_v20(pe: &Pe, data: &[u8], entry_off: usize) -> Option<Unpacked> {
+    let (struct_rva, struct_size) = locate_header_v20(pe, data, entry_off)?;
+    println!(
+        "[+] v2.0 stub header: rva=0x{:X} size={}",
+        struct_rva, struct_size
+    );
+
+    let header_off = pe.rva_to_off(struct_rva)?;
+    if header_off + struct_size as usize > data.len() {
+        eprintln!("[!] stub header out of bounds");
+        return None;
+    }
+    let mut header = data[header_off..header_off + struct_size as usize].to_vec();
+    steam_xor(&mut header, struct_size as usize, 0);
+
+    let (flags_off, oep_off, cssize_off, csxor_off) = match struct_size {
+        856 => (20usize, 40usize, 48usize, 52usize),
+        884 => (24usize, 44usize, 52usize, 56usize),
+        952 => (24usize, 44usize, 52usize, 56usize),
+        _ => {
+            eprintln!("[!] unknown v2.0 header size: {}", struct_size);
+            return None;
+        }
+    };
+
+    let flags = r32(&header, flags_off);
+    let oep_va = r32(&header, oep_off);
+    let cs_size = r32(&header, cssize_off) as usize;
+    let cs_key = r32(&header, csxor_off);
+    println!(
+        "[+] v2.0 flags=0x{:X} OEP=0x{:X} codeSize=0x{:X} codeXor=0x{:X}",
+        flags, oep_va, cs_size, cs_key
+    );
+
+    let cs_rva = pe.base_of_code;
+    let cs_idx = pe
+        .section_for_rva(cs_rva)
+        .or_else(|| pe.section_for_rva(pe.base_of_code))?;
+    let sec = &pe.sections[cs_idx];
+    println!(
+        "[+] code section: {} va=0x{:X} raw=0x{:X}+0x{:X}",
+        sec.name, sec.va, sec.raw_ptr, sec.raw_size
+    );
+
+    let mut new_section =
+        data[sec.raw_ptr as usize..(sec.raw_ptr + sec.raw_size) as usize].to_vec();
+
+    const USE_ENCODED_CODE_SECTION: u32 = 0x04;
+    if flags & USE_ENCODED_CODE_SECTION != 0 {
+        let dwords = cs_size >> 2;
+        let n = dwords.min(new_section.len() / 4);
+        println!("[+] XOR-decoding {} dwords of code section", n);
+        let mut key = cs_key;
+        let mut off = 0usize;
+        for _ in 0..n {
+            let val1 = r32(&new_section, off);
+            let val2 = val1 ^ key;
+            w32(&mut new_section, off, val2);
+            key = val1;
+            off += 4;
+        }
+    } else {
+        println!("[+] code section is not encoded");
+    }
+
+    Some(Unpacked {
+        section_index: cs_idx,
+        new_section,
+        oep_va,
+        variant: "v2.0",
+    })
 }
 
 fn main() {
@@ -358,189 +630,37 @@ fn main() {
     }
     println!("[+] SteamStub detected (entry marker C0DEC0DE)");
 
-    let (struct_rva, struct_size, struct_xor) = match locate_header(&pe, &data, entry_off) {
-        Some(v) => v,
+    let marker = *data.get(entry_off + 14).unwrap_or(&0);
+    let result = match marker {
+        0xC7 => unpack_v21(&pe, &data, entry_off),
+        0xBE => unpack_v20(&pe, &data, entry_off),
+        other => {
+            eprintln!("[!] unknown stub entry signature (opcode 0x{other:02X})");
+            process::exit(1);
+        }
+    };
+    let result = match result {
+        Some(r) => r,
         None => {
-            eprintln!("[!] failed to locate stub header via disassembly");
+            eprintln!("[!] unpacking failed");
             process::exit(1);
         }
     };
-    println!(
-        "[+] stub header: rva=0x{:X} size={} xor=0x{:X}",
-        struct_rva, struct_size, struct_xor
-    );
+    println!("[+] decrypted using {}", result.variant);
 
-    let header_off = match pe.rva_to_off(struct_rva) {
-        Some(o) => o,
-        None => {
-            eprintln!("[!] cannot map stub header RVA");
-            process::exit(1);
-        }
-    };
-    if header_off + struct_size as usize > data.len() {
-        eprintln!("[!] stub header out of bounds");
-        process::exit(1);
-    }
-    let mut header = data[header_off..header_off + struct_size as usize].to_vec();
-    let mut xor_key = steam_xor(&mut header, struct_size as usize, 0);
-    println!("[+] header decoded, rolling key=0x{:X}", xor_key);
-
-    let d0 = (struct_size / 4) == 0xD0;
-    let (pva_i, psz_i, dva_i, dsz_i, xt_i) = if d0 {
-        (8usize, 9usize, 14usize, 15usize, 16usize)
-    } else {
-        (9usize, 10usize, 15usize, 16usize, 17usize)
-    };
-    let payload_va = r32(&header, pva_i * 4);
-    let payload_size = r32(&header, psz_i * 4);
-    let drmp_va_off = r32(&header, dva_i * 4);
-    let drmp_size_off = r32(&header, dsz_i * 4);
-    let xtea_off = r32(&header, xt_i * 4);
-    println!(
-        "[+] header variant: {}  payloadVA=0x{:X} payloadSize={}",
-        if d0 { "0xD0" } else { "normal" },
-        payload_va,
-        payload_size
-    );
-
-    let payload_off = match pe.rva_to_off(pe.va_to_rva(payload_va)) {
-        Some(o) => o,
-        None => {
-            eprintln!("[!] cannot map payload VA");
-            process::exit(1);
-        }
-    };
-    if payload_off + payload_size as usize > data.len() {
-        eprintln!("[!] payload out of bounds");
-        process::exit(1);
-    }
-    let mut payload = data[payload_off..payload_off + payload_size as usize].to_vec();
-    xor_key = steam_xor(&mut payload, payload_size as usize, xor_key);
-    println!("[+] payload decoded ({} bytes, key now 0x{:X})", payload.len(), xor_key);
-
-    let drmp_va = r32(&payload, drmp_va_off as usize);
-    let drmp_size = r32(&payload, drmp_size_off as usize) as usize;
-    let drmp_off = match pe.rva_to_off(pe.va_to_rva(drmp_va)) {
-        Some(o) => o,
-        None => {
-            eprintln!("[!] cannot map SteamDRMP VA");
-            process::exit(1);
-        }
-    };
-    if drmp_off + drmp_size > data.len() {
-        eprintln!("[!] SteamDRMP out of bounds");
-        process::exit(1);
-    }
-    let mut drmp = data[drmp_off..drmp_off + drmp_size].to_vec();
-    println!("[+] SteamDRMP.dll: va=0x{:X} size={}", drmp_va, drmp_size);
-
-    let xtea_off = xtea_off as usize;
-    if xtea_off > payload.len() {
-        eprintln!("[!] xtea key offset out of range");
-        process::exit(1);
-    }
-    let key_count = (payload.len() - xtea_off) / 4;
-    let mut xtea_keys = Vec::with_capacity(key_count);
-    for i in 0..key_count {
-        xtea_keys.push(r32(&payload, xtea_off + i * 4));
-    }
-    drmp_decrypt_pass1(&mut drmp, drmp_size, &xtea_keys);
-    println!("[+] SteamDRMP decrypted ({} xtea keys)", xtea_keys.len());
-
-    let p1 = parse_pattern("8B ?? ?? ?? ?? ?? 89 ?? ?? ?? ?? ?? 8B ?? ?? ?? ?? ?? 89 ?? ?? ?? ?? ?? 8B ?? ?? ?? ?? ?? 89 ?? ?? ?? ?? ?? 8B ?? ?? ?? ?? ?? 89 ?? ?? ?? ?? ?? 8B ?? ?? ?? ?? ?? 89 ?? ?? ?? ?? ?? 8D ?? ?? ?? ?? ?? 05");
-    let p2 = parse_pattern("8B ?? ?? ?? ?? ?? 89 ?? ?? ?? ?? ?? 8B ?? ?? ?? ?? ?? 89 ?? ?? ?? ?? ?? 8B ?? ?? ?? ?? ?? 89 ?? ?? ?? ?? ?? 8B ?? ?? ?? ?? ?? 89 ?? ?? ?? ?? ?? 8B");
-    let p3 = parse_pattern("8B ?? ?? ?? ?? ?? 89 ?? ?? ?? ?? ?? 8B ?? ?? ?? ?? ?? A3 ?? ?? ?? ?? 8B ?? ?? ?? ?? ?? A3 ?? ?? ?? ?? 8B ?? ?? ?? ?? ?? A3 ?? ?? ?? ?? 8B ?? ?? ?? ?? ?? A3 ?? ?? ?? ?? 8B");
-
-    let (match_off, fallback) = if let Some(o) = find_pattern(&drmp, &p1) {
-        (o, false)
-    } else if let Some(o) = find_pattern(&drmp, &p2) {
-        (o, false)
-    } else if let Some(o) = find_pattern(&drmp, &p3) {
-        (o, true)
-    } else {
-        eprintln!("[!] failed to locate DRM offset table in SteamDRMP");
-        process::exit(1);
-    };
-    println!(
-        "[+] DRM offset table at SteamDRMP+0x{:X} (fallback={})",
-        match_off, fallback
-    );
-    if match_off + 1024 > drmp.len() {
-        eprintln!("[!] DRM offset table out of bounds");
-        process::exit(1);
-    }
-    let block = &drmp[match_off..match_off + 1024];
-    let (o0, o1, o2, o3, o4, o5, o6) = if fallback {
-        (2usize, 14usize, 25usize, 36usize, 47usize, 61usize, 72usize)
-    } else {
-        (2usize, 14usize, 26usize, 38usize, 50usize, 62usize, 67usize)
-    };
-    let mut offs = [0u32; 8];
-    for (i, o) in [o0, o1, o2, o3, o4, o5, o6].iter().enumerate() {
-        offs[i] = r32(block, *o);
-    }
-    offs[7] = offs[6].wrapping_add(16);
-    println!("[+] payload offsets: {:?}", offs);
-
-    // Step 5 - decrypt main code section
-    let flags = r32(&payload, offs[0] as usize);
-    const NO_ENCRYPTION: u32 = 0x04;
-    let cs_va = r32(&payload, offs[3] as usize);
-    let cs_rva = if offs[3] != 0 {
-        pe.va_to_rva(cs_va)
-    } else {
-        pe.base_of_code
-    };
-    let cs_idx = pe.section_for_rva(cs_rva).unwrap_or_else(|| {
-        pe.section_for_rva(pe.base_of_code).expect("code section")
-    });
-    let sec = &pe.sections[cs_idx];
-    println!(
-        "[+] code section: {} va=0x{:X} raw=0x{:X}+0x{:X} flags=0x{:X}",
-        sec.name, sec.va, sec.raw_ptr, sec.raw_size, flags
-    );
-
-    let orig_section =
-        data[sec.raw_ptr as usize..(sec.raw_ptr + sec.raw_size) as usize].to_vec();
-    let new_section: Vec<u8> = if flags & NO_ENCRYPTION == NO_ENCRYPTION {
-        println!("[+] code section is not encrypted");
-        orig_section.clone()
-    } else {
-        let aes_key = &payload[offs[5] as usize..offs[5] as usize + 32];
-        let aes_iv = &payload[offs[6] as usize..offs[6] as usize + 16];
-        let stolen = &payload[offs[7] as usize..offs[7] as usize + 16];
-        let enc_size = r32(&payload, offs[4] as usize) as usize;
-        println!(
-            "[+] decrypting: encSize={} sectionRawSize={} stolen={:02X?}",
-            enc_size, sec.raw_size, stolen
-        );
-        if enc_size + 16 > orig_section.len() {
-            eprintln!("[!] encrypted size exceeds section raw size");
-            process::exit(1);
-        }
-        let mut buf = vec![0u8; enc_size + 16];
-        buf[0..16].copy_from_slice(stolen);
-        buf[16..16 + enc_size]
-            .copy_from_slice(&data[sec.raw_ptr as usize..sec.raw_ptr as usize + enc_size]);
-        let mut iv = [0u8; 16];
-        iv.copy_from_slice(aes_iv);
-        let iv2 = aes256_ecb_decrypt_block(aes_key, &iv);
-        aes256_cbc_decrypt(aes_key, iv2, &mut buf);
-        let mut s = orig_section.clone();
-        s[0..enc_size].copy_from_slice(&buf[0..enc_size]);
-        s
-    };
-
-    // Rebuild: drop the trailing .bind section header, patch entry, truncate stub blob
+    let sec = &pe.sections[result.section_index];
     let num = pe.num_sections as usize;
+    if num < 2 {
+        eprintln!("[!] unexpected section count");
+        process::exit(1);
+    }
     let last_kept = &pe.sections[num - 2];
     let raw_end = (last_kept.raw_ptr + last_kept.raw_size) as usize;
-    let mut out = data[..raw_end].to_vec();
+    let mut out = data[..raw_end.min(data.len())].to_vec();
     out[sec.raw_ptr as usize..(sec.raw_ptr + sec.raw_size) as usize]
-        .copy_from_slice(&new_section);
+        .copy_from_slice(&result.new_section);
 
-    let oep_va = r32(&payload, offs[2] as usize);
-    let oep_rva = pe.va_to_rva(oep_va);
+    let oep_rva = pe.va_to_rva(result.oep_va);
     w16(&mut out, pe.pe_off + 6, (num - 1) as u16);
     w32(&mut out, pe.opt_off + 16, oep_rva);
     w32(&mut out, pe.opt_off + 64, 0);
