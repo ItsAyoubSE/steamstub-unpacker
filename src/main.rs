@@ -7,8 +7,6 @@ use aes::cipher::{BlockDecrypt, KeyInit};
 use aes::Aes256;
 use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind};
 
-const IMAGE_SCN: u32 = 0x1000;
-
 fn r16(d: &[u8], o: usize) -> u16 {
     u16::from_le_bytes([d[o], d[o + 1]])
 }
@@ -308,10 +306,13 @@ fn align_up(v: u32, a: u32) -> u32 {
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    let input = args
-        .get(1)
-        .cloned()
-        .unwrap_or_else(|| r"C:\Program Files (x86)\Steam\steamapps\common\Grand Theft Auto 3\gta3.exe".into());
+    let input = match args.get(1) {
+        Some(v) => v.clone(),
+        None => {
+            eprintln!("usage: steamstub-unpacker <input.exe> [output.exe]");
+            process::exit(2);
+        }
+    };
     let output = args
         .get(2)
         .cloned()
